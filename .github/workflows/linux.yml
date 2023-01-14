@@ -7,7 +7,7 @@ name: Linux
 
 jobs:
   release:
-    name: Release Packaging
+    name: Linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
@@ -18,7 +18,7 @@ jobs:
           override: true
 
       - name: Edit Cargo.toml
-        run: sed -i 's#codegem = { path = "../codegem" }#codegem = { git = "https://github.com/code-gem/codegem" }#'
+        run: sed -i 's#codegem = { path = "../codegem" }#codegem = { git = "https://github.com/code-gem/codegem" }#' Cargo.toml
 
       - name: Release Build
         run: cargo build --release
