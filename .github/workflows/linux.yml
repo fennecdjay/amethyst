@@ -1,0 +1,27 @@
+on:
+  push:
+    branches:
+      - main
+
+name: Linux
+
+jobs:
+  release:
+    name: Release Packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Edit Cargo.toml
+        run: sed -i 's#codegem = { path = "../codegem" }#codegem = { git = "https://github.com/code-gem/codegem" }#'
+
+      - name: Release Build
+        run: cargo build --release
+
+# todo: some testing
+# releases?
