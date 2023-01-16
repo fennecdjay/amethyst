@@ -19,10 +19,8 @@ jobs:
 
       - name: Edit Cargo.toml
         run: |
-          sed 's#codegem = { path = "../codegem" }#codegem = { git = "https://github.com/code-gem/codegem" }#' Cargo.toml > tmp
           rm Cargo.toml
-          mv tmp Cargo.toml
-          cat Cargo.toml
+          cp scripts/Cargo.toml .
 
       - name: Release Build
         run: cargo build --release
