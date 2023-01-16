@@ -18,7 +18,7 @@ jobs:
           override: true
 
       - name: Edit Cargo.toml
-        run:|
+        run: |
           sed 's#codegem = { path = "../codegem" }#codegem = { git = "https://github.com/code-gem/codegem" }#' Cargo.toml > tmp
           mv tmp Cargo.toml
 
