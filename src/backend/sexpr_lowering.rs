@@ -2,17 +2,18 @@
 
 use std::collections::HashMap;
 
-use crate::frontend::ast_lowering::{LValue, SExpr, Type as SExprType};
+use crate::frontend::ast_lowering::{SExpr, Type as SExprType};
 
 use codegem::ir::{
-    BasicBlockId, FunctionId, Module, ModuleBuilder, Operation, Terminator, ToIntegerOperation,
-    Type as IrType, Value, VariableId,
+    BasicBlockId, FunctionId, Linkage, Module, ModuleBuilder, Operation, Terminator,
+    ToIntegerOperation, Type as IrType, Value, VariableId,
 };
 
 struct LowerHelperArgs {
     breaks: Vec<Vec<(BasicBlockId, Option<Value>)>>,
     var_map: Vec<HashMap<String, VariableId>>,
     func_map: HashMap<String, FunctionId>,
+    in_let: bool,
 }
 
 fn lower_helper(
@@ -23,7 +24,7 @@ fn lower_helper(
     let type_ = convert_type(&sexpr.meta().type_);
     match sexpr {
         SExpr::Int { meta, value } => {
-            builder.push_instruction(&type_, value.to_integer_operation())
+            builder.push_instruction(value.to_integer_operation())
         }
 
         SExpr::Float { meta, value } => todo!(),
@@ -31,8 +32,8 @@ fn lower_helper(
 
         SExpr::Symbol { meta, value } => {
             for scope in args.var_map.iter().rev() {
-                if let Some(var) = scope.get(value) {
-                    return builder.push_instruction(&type_, Operation::GetVar(*var));
+                if let Some(var) = scope.get(&value) {
+                    return builder.push_instruction(Operation::GetVar(*var));
                 }
             }
             None
@@ -90,7 +91,7 @@ fn lower_helper(
             if mapping.is_empty() {
                 None
             } else {
-                builder.push_instruction(&type_, Operation::Phi(mapping))
+                builder.push_instruction(Operation::Phi(mapping))
             }
         }
 
@@ -120,7 +121,7 @@ fn lower_helper(
                 } else if mappings.len() == 1 {
                     Some(mappings[0].1)
                 } else {
-                    builder.push_instruction(&type_, Operation::Phi(mappings))
+                    builder.push_instruction(Operation::Phi(mappings))
                 }
             } else {
                 unreachable!();
@@ -144,162 +145,149 @@ fn lower_helper(
 
         SExpr::Type { meta, value } => lower_helper(builder, *value, args),
 
-        SExpr::FuncDef {
-            meta,
-            name,
-            ret_type,
-            args,
-            expr,
-        } => unreachable!(),
+        SExpr::FuncDef { .. } => unreachable!(),
 
         SExpr::FuncCall { meta, func, values } => match *func {
-            SExpr::Symbol { value: "+", .. } => {
+            SExpr::Symbol { value, .. } if value == "+" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::Add(values[0], values[1]))
+                builder.push_instruction(Operation::Add(values[0], values[1]))
             }
 
-            SExpr::Symbol { value: "-", .. } => {
+            SExpr::Symbol { value, .. } if value == "-" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::Sub(values[0], values[1]))
+                builder.push_instruction(Operation::Sub(values[0], values[1]))
             }
 
-            SExpr::Symbol { value: "*", .. } => {
+            SExpr::Symbol { value, .. } if value == "*" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::Mul(values[0], values[1]))
+                builder.push_instruction(Operation::Mul(values[0], values[1]))
             }
 
-            SExpr::Symbol { value: "/", .. } => {
+            SExpr::Symbol { value, .. } if value == "/" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::Div(values[0], values[1]))
+                builder.push_instruction(Operation::Div(values[0], values[1]))
             }
 
-            SExpr::Symbol { value: "%", .. } => {
+            SExpr::Symbol { value, .. } if value == "%" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::Mod(values[0], values[1]))
+                builder.push_instruction(Operation::Mod(values[0], values[1]))
             }
 
-            SExpr::Symbol { value: "<<", .. } => {
+            SExpr::Symbol { value, .. } if value == "<<" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::Bsl(values[0], values[1]))
+                builder.push_instruction(Operation::Bsl(values[0], values[1]))
             }
 
-            SExpr::Symbol { value: "%", .. } => {
+            SExpr::Symbol { value, .. } if value == ">>" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::Mod(values[0], values[1]))
+                builder.push_instruction(Operation::Bsr(values[0], values[1]))
             }
 
-            SExpr::Symbol { value: ">>", .. } => {
+            SExpr::Symbol { value, .. } if value == "==" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::Bsr(values[0], values[1]))
+                builder.push_instruction(Operation::Eq(values[0], values[1]))
             }
 
-            SExpr::Symbol { value: "==", .. } => {
+            SExpr::Symbol { value, .. } if value == "!=" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::Eq(values[0], values[1]))
+                builder.push_instruction(Operation::Ne(values[0], values[1]))
             }
 
-            SExpr::Symbol { value: "!=", .. } => {
+            SExpr::Symbol { value, .. } if value == "<" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::Ne(values[0], values[1]))
+                builder.push_instruction(Operation::Lt(values[0], values[1]))
             }
 
-            SExpr::Symbol { value: "<", .. } => {
+            SExpr::Symbol { value, .. } if value == "<=" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::Lt(values[0], values[1]))
+                builder.push_instruction(Operation::Le(values[0], values[1]))
             }
 
-            SExpr::Symbol { value: "<=", .. } => {
+            SExpr::Symbol { value, .. } if value == ">" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::Le(values[0], values[1]))
+                builder.push_instruction(Operation::Gt(values[0], values[1]))
             }
 
-            SExpr::Symbol { value: ">", .. } => {
+            SExpr::Symbol { value, .. } if value == ">=" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::Gt(values[0], values[1]))
+                builder.push_instruction(Operation::Ge(values[0], values[1]))
             }
 
-            SExpr::Symbol { value: ">=", .. } => {
+            SExpr::Symbol { value, .. } if value == "&" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::Ge(values[0], values[1]))
+                builder.push_instruction(Operation::BitAnd(values[0], values[1]))
             }
 
-            SExpr::Symbol { value: "&", .. } => {
+            SExpr::Symbol { value, .. } if value == "|" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::BitAnd(values[0], values[1]))
+                builder.push_instruction(Operation::BitOr(values[0], values[1]))
             }
 
-            SExpr::Symbol { value: "|", .. } => {
+            SExpr::Symbol { value, .. } if value == "^" => {
                 let values: Vec<_> = values
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::BitOr(values[0], values[1]))
-            }
-
-            SExpr::Symbol { value: "^", .. } => {
-                let values: Vec<_> = values
-                    .into_iter()
-                    .flat_map(|v| lower_helper(builder, v, args))
-                    .collect();
-                builder.push_instruction(&type_, Operation::BitXor(values[0], values[1]))
+                builder.push_instruction(Operation::BitXor(values[0], values[1]))
             }
 
             SExpr::Symbol { meta, value } => {
                 for scope in args.var_map.iter().rev() {
-                    if let Some(var) = scope.get(value) {
+                    if let Some(var) = scope.get(&value) {
                         let v = builder
-                            .push_instruction(&convert_type(&meta.type_), Operation::GetVar(*var))
+                            .push_instruction(Operation::GetVar(*var))
                             .unwrap();
                         let values: Vec<_> = values
                             .into_iter()
                             .flat_map(|v| lower_helper(builder, v, args))
                             .collect();
-                        return builder.push_instruction(&type_, Operation::CallIndirect(v, values));
+                        return builder
+                            .push_instruction(Operation::CallIndirect(v, values));
                     }
                 }
 
@@ -307,8 +295,8 @@ fn lower_helper(
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                if let Some(func) = args.func_map.get(value) {
-                    builder.push_instruction(&type_, Operation::Call(*func, values))
+                if let Some(func) = args.func_map.get(&value) {
+                    builder.push_instruction(Operation::Call(*func, values))
                 } else {
                     None
                 }
@@ -320,7 +308,7 @@ fn lower_helper(
                     .into_iter()
                     .flat_map(|v| lower_helper(builder, v, args))
                     .collect();
-                builder.push_instruction(&type_, Operation::CallIndirect(f, values))
+                builder.push_instruction(Operation::CallIndirect(f, values))
             }
         },
 
@@ -332,58 +320,62 @@ fn lower_helper(
             linked_to,
         } => todo!(),
 
-        SExpr::StructDef { meta, name, fields } => todo!(),
+        SExpr::StructDef { .. } => todo!(),
 
         SExpr::StructSet { meta, name, values } => todo!(),
 
-        SExpr::Declare {
-            meta,
-            mutable,
-            variable,
-            value,
-        } => {
-            if let Some(v) = lower_helper(builder, *value, args) {
-                let var = builder
-                    .push_variable(variable, &convert_type(&meta.type_))
-                    .unwrap();
-                args.var_map
-                    .last_mut()
-                    .unwrap()
-                    .insert(variable.to_owned(), var);
-                builder.push_instruction(&IrType::Void, Operation::SetVar(var, v));
-                builder.push_instruction(&type_, Operation::GetVar(var))
-            } else {
-                None
-            }
-        }
-
-        SExpr::Assign {
-            meta,
-            lvalue: LValue::Symbol(variable),
-            value,
-        } => {
-            if let Some(v) = lower_helper(builder, *value, args) {
-                for scope in args.var_map.iter().rev() {
-                    if let Some(var) = scope.get(variable) {
-                        builder.push_instruction(&IrType::Void, Operation::SetVar(*var, v));
-                        return builder.push_instruction(&type_, Operation::GetVar(*var));
-                    }
+        SExpr::Declare { meta, settings, .. } => {
+            let last_in_let = args.in_let;
+            args.in_let = true;
+            let mut built = None;
+            for setting in settings {
+                let v = lower_helper(builder, setting, args);
+                if let Some(built_) = built {
+                    built = builder.push_instruction(
+                        Operation::BitOr(built_, v.unwrap()),
+                    );
+                } else {
+                    built = v;
                 }
             }
-            None
+            args.in_let = last_in_let;
+
+            built
         }
 
-        SExpr::Assign {
-            meta,
-            lvalue,
-            value,
-        } => todo!(),
+        SExpr::Assign { meta, var, value } => {
+            if let Some(v) = lower_helper(builder, *value, args) {
+                for scope in args.var_map.iter().rev() {
+                    if let Some(var) = scope.get(&var) {
+                        builder.push_instruction(Operation::SetVar(*var, v));
+                        return builder.push_instruction(
+                            true.to_integer_operation(),
+                        );
+                    }
+                }
+
+                if args.in_let {
+                    let variable = builder
+                        .push_variable(&var, &convert_type(&meta.type_))
+                        .unwrap();
+                    args.var_map.last_mut().unwrap().insert(var, variable);
+                    builder.push_instruction(Operation::SetVar(variable, v));
+                    return builder.push_instruction(
+                        true.to_integer_operation(),
+                    );
+                }
+            }
+
+            None
+        }
 
         SExpr::Attribute { meta, top, attr } => todo!(),
         SExpr::SliceGet { meta, top, index } => todo!(),
         SExpr::SizeOf { meta, type_ } => todo!(),
         SExpr::Ref { meta, value } => todo!(),
         SExpr::Deref { meta, value } => todo!(),
+
+        SExpr::Import { .. } => None,
     }
 }
 
@@ -409,23 +401,55 @@ pub fn lower(sexprs: Vec<SExpr>) -> Module {
         breaks: Vec::new(),
         var_map: Vec::new(),
         func_map: HashMap::new(),
+        in_let: false,
     };
 
     for sexpr in sexprs.iter() {
-        if let SExpr::FuncDef {
-            name,
-            ret_type,
-            args,
-            ..
-        } = sexpr
-        {
-            let args: Vec<_> = args.iter().map(|(n, t)| (*n, convert_type(t))).collect();
-            let func = if *name == "main" {
-                builder.new_function(name, &args, &convert_type(ret_type))
-            } else {
-                builder.new_function(&format!("_amy_{}", name), &args, &convert_type(ret_type))
-            };
-            helper_args.func_map.insert((*name).to_owned(), func);
+        match sexpr {
+            SExpr::FuncDef {
+                name,
+                ret_type,
+                args,
+                ..
+            } => {
+                let args: Vec<_> = args
+                    .iter()
+                    .map(|(n, t)| (n.clone(), convert_type(t)))
+                    .collect();
+                let func = if *name == "main" {
+                    builder.new_function(name, Linkage::Public, &args, &convert_type(ret_type))
+                } else {
+                    builder.new_function(
+                        &format!("_amy_{}", name),
+                        Linkage::Private,
+                        &args,
+                        &convert_type(ret_type),
+                    )
+                };
+                helper_args.func_map.insert((*name).to_owned(), func);
+            }
+
+            SExpr::FuncExtern {
+                name,
+                ret_type,
+                args,
+                linked_to,
+                ..
+            } => {
+                let args: Vec<_> = args
+                    .iter()
+                    .map(|(n, t)| (n.clone(), convert_type(t)))
+                    .collect();
+                let func = builder.new_function(
+                    linked_to,
+                    Linkage::External,
+                    &args,
+                    &convert_type(ret_type),
+                );
+                helper_args.func_map.insert((*name).to_owned(), func);
+            }
+
+            _ => (),
         }
     }
 
@@ -433,12 +457,13 @@ pub fn lower(sexprs: Vec<SExpr>) -> Module {
         match sexpr {
             SExpr::FuncDef {
                 meta,
+                ann,
                 name,
                 ret_type,
                 args,
                 expr,
             } => {
-                let func = *helper_args.func_map.get(name).unwrap();
+                let func = *helper_args.func_map.get(&name).unwrap();
                 builder.switch_to_function(func);
                 let block = builder.push_block().unwrap();
                 builder.switch_to_block(block);
@@ -464,7 +489,7 @@ pub fn lower(sexprs: Vec<SExpr>) -> Module {
                 args,
                 linked_to,
             } => (),
-            SExpr::StructDef { meta, name, fields } => (),
+            SExpr::StructDef { .. } => (),
             _ => (),
         }
     }

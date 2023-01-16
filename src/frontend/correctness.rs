@@ -1,6 +1,9 @@
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::{
+    collections::{hash_map::Entry, HashMap, HashSet},
+    path::{Path, PathBuf},
+};
 
-use super::ast_lowering::{LValue, SExpr, Type};
+use super::ast_lowering::{Annotations, SExpr, Type};
 
 #[derive(Debug)]
 pub enum CorrectnessError {}
@@ -11,10 +14,7 @@ enum FloatOrInt {
     Int,
 }
 
-fn get_leaf<'a, 'b>(
-    mut t: &'b Type<'a>,
-    substitutions: &'b HashMap<u64, Type<'a>>,
-) -> &'b Type<'a> {
+fn get_leaf<'a, 'b>(mut t: &'b Type, substitutions: &'b HashMap<u64, Type>) -> &'b Type {
     while let Type::TypeVariable(i) = t {
         if let Some(u) = substitutions.get(i) {
             t = u;
@@ -25,18 +25,12 @@ fn get_leaf<'a, 'b>(
     t
 }
 
-fn check_coercion(
-    coercions: &mut HashMap<u64, FloatOrInt>,
-    i: &u64,
-    t: &Type,
-) -> bool {
+fn check_coercion(coercions: &mut HashMap<u64, FloatOrInt>, i: &u64, t: &Type) -> bool {
     match (coercions.get(i), &t) {
         (Some(FloatOrInt::Int), Type::Int(_, _)) => true,
         (Some(FloatOrInt::Float), Type::F32 | Type::F64) => true,
         (Some(&v), Type::TypeVariable(j)) => match coercions.entry(*j) {
-            Entry::Occupied(w) => {
-                *w.get() == v
-            }
+            Entry::Occupied(w) => *w.get() == v,
 
             Entry::Vacant(w) => {
                 w.insert(v);
@@ -52,10 +46,10 @@ fn check_coercion(
     }
 }
 
-fn substitute<'a>(
-    assignee: &mut Type<'a>,
-    assigner: &Type<'a>,
-    substitutions: &mut HashMap<u64, Type<'a>>,
+fn substitute(
+    assignee: &mut Type,
+    assigner: &Type,
+    substitutions: &mut HashMap<u64, Type>,
     coercions: &mut HashMap<u64, FloatOrInt>,
 ) -> Result<(), CorrectnessError> {
     *assignee = get_leaf(assignee, substitutions).clone();
@@ -140,17 +134,26 @@ fn substitute<'a>(
     }
 }
 
+#[derive(Copy, Clone)]
+enum LetStatus {
+    NoLet,
+    Conditional,
+    Direct,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn traverse_sexpr<'a>(
-    sexpr: &mut SExpr<'a>,
+fn traverse_sexpr(
+    sexpr: &mut SExpr,
     type_var_counter: &mut u64,
-    substitutions: &mut HashMap<u64, Type<'a>>,
+    substitutions: &mut HashMap<u64, Type>,
     coercions: &mut HashMap<u64, FloatOrInt>,
-    func_map: &HashMap<&'a str, Signature<'a>>,
-    struct_map: &HashMap<&'a str, Struct<'a>>,
-    monomorphisms: &mut Vec<(Type<'a>, usize)>,
-    scopes: &mut Vec<HashMap<&'a str, Type<'a>>>,
-    break_type: &mut Option<Type<'a>>,
+    func_map: &mut Vec<HashMap<String, Signature>>,
+    struct_map: &mut Vec<HashMap<String, Struct>>,
+    monomorphisms: &mut Vec<(Type, usize)>,
+    scopes: &mut Vec<HashMap<String, (Type, LetStatus)>>,
+    break_type: &mut Option<Type>,
+    let_status: LetStatus,
+    exports: &HashMap<PathBuf, ModuleExports>,
 ) -> Result<(), CorrectnessError> {
     //println!("{:?}: {:?}\n", sexpr.meta().range, sexpr);
 
@@ -169,18 +172,31 @@ fn traverse_sexpr<'a>(
         SExpr::Int { .. } | SExpr::Float { .. } | SExpr::Str { .. } | SExpr::Nil { .. } => Ok(()),
 
         SExpr::Symbol { meta, value } => {
-            let mut var_type = None;
+            let mut var = None;
             for scope in scopes.iter().rev() {
                 if let Some(t) = scope.get(value) {
-                    var_type = Some(t);
+                    var = Some(t);
                     break;
                 }
             }
 
-            if let Some(var_type) = var_type {
+            if let Some((var_type, let_status)) = var {
+                if let LetStatus::Conditional = let_status {
+                    todo!("error handling");
+                }
+
                 substitute(&mut meta.type_, var_type, substitutions, coercions)?;
                 Ok(())
-            } else if let Some(func) = func_map.get(value) {
+            } else if let Some(func) = {
+                let mut var = None;
+                for scope in func_map.iter().rev() {
+                    if let Some(v) = scope.get(value) {
+                        var = Some(v);
+                        break;
+                    }
+                }
+                var
+            } {
                 substitute(
                     &mut meta.type_,
                     &Type::Function(func.arg_types.clone(), Box::new(func.ret_type.clone())),
@@ -212,19 +228,30 @@ fn traverse_sexpr<'a>(
                     monomorphisms,
                     scopes,
                     break_type,
+                    let_status,
+                    exports,
                 )?;
             }
 
-            let new_type = Type::Tuple(tuple.iter().map(|_| {
-                let t = Type::TypeVariable(*type_var_counter);
-                *type_var_counter += 1;
-                t
-            }).collect());
+            let new_type = Type::Tuple(
+                tuple
+                    .iter()
+                    .map(|_| {
+                        let t = Type::TypeVariable(*type_var_counter);
+                        *type_var_counter += 1;
+                        t
+                    })
+                    .collect(),
+            );
             substitute(&mut meta.type_, &new_type, substitutions, coercions)
         }
 
         SExpr::Seq { meta, values } => {
-            scopes.push(HashMap::new());
+            if !matches!(let_status, LetStatus::Conditional) {
+                scopes.push(HashMap::new());
+            }
+            func_map.push(HashMap::new());
+            struct_map.push(HashMap::new());
             for value in values.iter_mut() {
                 traverse_sexpr(
                     value,
@@ -236,6 +263,8 @@ fn traverse_sexpr<'a>(
                     monomorphisms,
                     scopes,
                     break_type,
+                    let_status,
+                    exports,
                 )?;
             }
 
@@ -248,13 +277,21 @@ fn traverse_sexpr<'a>(
                 )?;
             }
 
-            scopes.pop();
+            if !matches!(let_status, LetStatus::Conditional) {
+                scopes.pop();
+            }
+            func_map.pop();
+            struct_map.pop();
             Ok(())
         }
 
         SExpr::Cond { meta, values, elsy } => {
             for (cond, then) in values.iter_mut() {
-                scopes.push(HashMap::new());
+                if !matches!(let_status, LetStatus::Conditional) {
+                    scopes.push(HashMap::new());
+                }
+                func_map.push(HashMap::new());
+                struct_map.push(HashMap::new());
                 traverse_sexpr(
                     cond,
                     type_var_counter,
@@ -265,7 +302,14 @@ fn traverse_sexpr<'a>(
                     monomorphisms,
                     scopes,
                     break_type,
+                    let_status,
+                    exports,
                 )?;
+
+                for (_, let_status) in scopes.last_mut().unwrap().values_mut() {
+                    *let_status = LetStatus::Direct;
+                }
+
                 traverse_sexpr(
                     then,
                     type_var_counter,
@@ -276,6 +320,8 @@ fn traverse_sexpr<'a>(
                     monomorphisms,
                     scopes,
                     break_type,
+                    let_status,
+                    exports,
                 )?;
 
                 match &cond.meta().type_ {
@@ -302,11 +348,20 @@ fn traverse_sexpr<'a>(
                     substitutions,
                     coercions,
                 )?;
-                scopes.pop();
+
+                if !matches!(let_status, LetStatus::Conditional) {
+                    scopes.pop();
+                }
+                func_map.pop();
+                struct_map.pop();
             }
 
             if let Some(elsy) = elsy {
-                scopes.push(HashMap::new());
+                if !matches!(let_status, LetStatus::Conditional) {
+                    scopes.push(HashMap::new());
+                }
+                func_map.push(HashMap::new());
+                struct_map.push(HashMap::new());
                 traverse_sexpr(
                     &mut **elsy,
                     type_var_counter,
@@ -317,6 +372,8 @@ fn traverse_sexpr<'a>(
                     monomorphisms,
                     scopes,
                     break_type,
+                    let_status,
+                    exports,
                 )?;
                 substitute(
                     &mut meta.type_,
@@ -324,7 +381,11 @@ fn traverse_sexpr<'a>(
                     substitutions,
                     coercions,
                 )?;
-                scopes.pop();
+                if !matches!(let_status, LetStatus::Conditional) {
+                    scopes.pop();
+                }
+                func_map.pop();
+                struct_map.pop();
             } else if meta.type_ != Type::Tuple(vec![]) {
                 todo!("error handling");
             }
@@ -333,7 +394,11 @@ fn traverse_sexpr<'a>(
         }
 
         SExpr::Loop { meta, value } => {
-            scopes.push(HashMap::new());
+            if !matches!(let_status, LetStatus::Conditional) {
+                scopes.push(HashMap::new());
+            }
+            func_map.push(HashMap::new());
+            struct_map.push(HashMap::new());
             let mut break_type = Some(Type::Unknown);
             traverse_sexpr(
                 &mut **value,
@@ -345,6 +410,8 @@ fn traverse_sexpr<'a>(
                 monomorphisms,
                 scopes,
                 &mut break_type,
+                let_status,
+                exports,
             )?;
 
             let t = match break_type {
@@ -353,7 +420,11 @@ fn traverse_sexpr<'a>(
                 None => unreachable!(),
             };
             substitute(&mut meta.type_, &t, substitutions, coercions)?;
-            scopes.pop();
+            if !matches!(let_status, LetStatus::Conditional) {
+                scopes.pop();
+            }
+            func_map.pop();
+            struct_map.pop();
 
             Ok(())
         }
@@ -370,6 +441,8 @@ fn traverse_sexpr<'a>(
                     monomorphisms,
                     scopes,
                     break_type,
+                    let_status,
+                    exports,
                 )?;
                 if let Some(type_) = break_type {
                     substitute(type_, &value.meta().type_, substitutions, coercions)
@@ -394,6 +467,8 @@ fn traverse_sexpr<'a>(
                 monomorphisms,
                 scopes,
                 break_type,
+                let_status,
+                exports,
             )?;
             substitute(
                 &mut value.meta_mut().type_,
@@ -416,6 +491,8 @@ fn traverse_sexpr<'a>(
                 monomorphisms,
                 scopes,
                 break_type,
+                let_status,
+                exports,
             )?;
 
             for value in values.iter_mut() {
@@ -429,6 +506,8 @@ fn traverse_sexpr<'a>(
                     monomorphisms,
                     scopes,
                     break_type,
+                    let_status,
+                    exports,
                 )?;
             }
 
@@ -454,12 +533,22 @@ fn traverse_sexpr<'a>(
         SExpr::StructDef { .. } => Ok(()),
 
         SExpr::StructSet { meta, name, values } => {
-            if let Some(struct_) = struct_map.get(name) {
+            if let Some(struct_) = {
+                let mut var = None;
+                for scope in struct_map.iter().rev() {
+                    if let Some(v) = scope.get(name) {
+                        var = Some(v);
+                        break;
+                    }
+                }
+                var
+            } {
+                let struct_ = struct_.clone();
                 let mut map = HashMap::new();
                 let mut generics = vec![];
                 for g in struct_.generics.iter() {
-                    if let &Type::Generic(g) = g {
-                        map.insert(g, Type::TypeVariable(*type_var_counter));
+                    if let Type::Generic(g) = g {
+                        map.insert(g.clone(), Type::TypeVariable(*type_var_counter));
                         generics.push(Type::TypeVariable(*type_var_counter));
                         *type_var_counter += 1;
                     } else {
@@ -478,6 +567,8 @@ fn traverse_sexpr<'a>(
                         monomorphisms,
                         scopes,
                         break_type,
+                        let_status,
+                        exports,
                     )?;
                     if let Some((_, typ)) = struct_.fields.iter().find(|(v, _)| v == field) {
                         let mut typ = typ.clone();
@@ -490,7 +581,7 @@ fn traverse_sexpr<'a>(
 
                 substitute(
                     &mut meta.type_,
-                    &Type::Struct(name, generics),
+                    &Type::Struct(name.clone(), generics),
                     substitutions,
                     coercions,
                 )?;
@@ -503,39 +594,46 @@ fn traverse_sexpr<'a>(
 
         SExpr::Declare {
             meta,
-            variable,
-            value,
+            conditional,
+            settings,
             ..
         } => {
-            traverse_sexpr(
-                &mut **value,
-                type_var_counter,
-                substitutions,
-                coercions,
-                func_map,
-                struct_map,
-                monomorphisms,
-                scopes,
-                break_type,
-            )?;
             substitute(
                 &mut meta.type_,
-                &value.meta().type_,
+                &Type::Int(false, 1),
                 substitutions,
                 coercions,
             )?;
-            scopes
-                .last_mut()
-                .unwrap()
-                .insert(*variable, meta.type_.clone());
+
+            for setting in settings {
+                traverse_sexpr(
+                    setting,
+                    type_var_counter,
+                    substitutions,
+                    coercions,
+                    func_map,
+                    struct_map,
+                    monomorphisms,
+                    scopes,
+                    break_type,
+                    if *conditional {
+                        LetStatus::Conditional
+                    } else {
+                        LetStatus::Direct
+                    },
+                    exports,
+                )?;
+                substitute(
+                    &mut meta.type_,
+                    &setting.meta().type_,
+                    substitutions,
+                    coercions,
+                )?;
+            }
             Ok(())
         }
 
-        SExpr::Assign {
-            meta,
-            lvalue: LValue::Symbol(variable),
-            value,
-        } => {
+        SExpr::Assign { meta, var, value } => {
             traverse_sexpr(
                 &mut **value,
                 type_var_counter,
@@ -546,59 +644,36 @@ fn traverse_sexpr<'a>(
                 monomorphisms,
                 scopes,
                 break_type,
+                let_status,
+                exports,
+            )?;
+            substitute(
+                &mut meta.type_,
+                &Type::Int(false, 1),
+                substitutions,
+                coercions,
             )?;
 
             let mut var_type = None;
             for scope in scopes.iter_mut().rev() {
-                if let Some(t) = scope.get_mut(variable) {
+                if let Some(t) = scope.get_mut(var) {
                     var_type = Some(t);
                     break;
                 }
             }
 
-            if let Some(var_type) = var_type {
+            if let Some((var_type, _)) = var_type {
                 substitute(var_type, &value.meta().type_, substitutions, coercions)?;
-                substitute(&mut meta.type_, var_type, substitutions, coercions)?;
+                Ok(())
+            } else if let LetStatus::Direct | LetStatus::Conditional = let_status {
+                scopes
+                    .last_mut()
+                    .unwrap()
+                    .insert(var.clone(), (value.meta().type_.clone(), let_status));
                 Ok(())
             } else {
                 todo!("error handling");
             }
-        }
-
-        SExpr::Assign {
-            meta,
-            lvalue,
-            value,
-        } => {
-            let type_ = traverse_lvalue(
-                lvalue,
-                type_var_counter,
-                substitutions,
-                coercions,
-                func_map,
-                struct_map,
-                monomorphisms,
-                scopes,
-                break_type,
-            )?;
-            substitute(&mut meta.type_, &type_, substitutions, coercions)?;
-            traverse_sexpr(
-                &mut **value,
-                type_var_counter,
-                substitutions,
-                coercions,
-                func_map,
-                struct_map,
-                monomorphisms,
-                scopes,
-                break_type,
-            )?;
-            substitute(
-                &mut value.meta_mut().type_,
-                &meta.type_,
-                substitutions,
-                coercions,
-            )
         }
 
         SExpr::Attribute { meta, top, attr } => {
@@ -612,10 +687,12 @@ fn traverse_sexpr<'a>(
                 monomorphisms,
                 scopes,
                 break_type,
+                let_status,
+                exports,
             )?;
 
             match &top.meta().type_ {
-                Type::Slice(_, t) => match *attr {
+                Type::Slice(_, t) => match attr.as_str() {
                     "ptr" => substitute(
                         &mut meta.type_,
                         &Type::Pointer(true, t.clone()),
@@ -644,7 +721,7 @@ fn traverse_sexpr<'a>(
                     }
 
                     match t {
-                        Type::Slice(_, u) => match *attr {
+                        Type::Slice(_, u) => match attr.as_str() {
                             "ptr" => {
                                 t = Type::Pointer(true, u.clone());
                             }
@@ -657,14 +734,23 @@ fn traverse_sexpr<'a>(
                         },
 
                         Type::Struct(name, generics) => {
-                            if let Some(struct_) = struct_map.get(name) {
+                            if let Some(struct_) = {
+                                let mut var = None;
+                                for scope in struct_map.iter().rev() {
+                                    if let Some(v) = scope.get(&name) {
+                                        var = Some(v);
+                                        break;
+                                    }
+                                }
+                                var
+                            } {
                                 let mut map = struct_
                                     .generics
                                     .iter()
                                     .zip(generics)
                                     .map(|(key, val)| {
-                                        if let &Type::Generic(key) = key {
-                                            (key, val)
+                                        if let Type::Generic(key) = key {
+                                            (key.clone(), val)
                                         } else {
                                             unreachable!();
                                         }
@@ -705,6 +791,8 @@ fn traverse_sexpr<'a>(
                 monomorphisms,
                 scopes,
                 break_type,
+                let_status,
+                exports,
             )?;
 
             traverse_sexpr(
@@ -717,12 +805,24 @@ fn traverse_sexpr<'a>(
                 monomorphisms,
                 scopes,
                 break_type,
+                let_status,
+                exports,
             )?;
 
-            substitute(&mut index.meta_mut().type_, &Type::Int(false, 64), substitutions, coercions)?;
+            substitute(
+                &mut index.meta_mut().type_,
+                &Type::Int(false, 64),
+                substitutions,
+                coercions,
+            )?;
             match &top.meta().type_ {
                 Type::Slice(_, t) => substitute(&mut meta.type_, &**t, substitutions, coercions),
-                t @ Type::TypeVariable(_) => substitute(&mut Type::Slice(false, Box::new(meta.type_.clone())), t, substitutions, coercions),
+                t @ Type::TypeVariable(_) => substitute(
+                    &mut Type::Slice(false, Box::new(meta.type_.clone())),
+                    t,
+                    substitutions,
+                    coercions,
+                ),
 
                 _ => todo!("error handling"),
             }
@@ -731,7 +831,7 @@ fn traverse_sexpr<'a>(
         SExpr::SizeOf { .. } => Ok(()),
 
         SExpr::Ref { meta, value } => {
-            let t = traverse_lvalue(
+            traverse_sexpr(
                 value,
                 type_var_counter,
                 substitutions,
@@ -741,8 +841,10 @@ fn traverse_sexpr<'a>(
                 monomorphisms,
                 scopes,
                 break_type,
+                let_status,
+                exports,
             )?;
-            let t = Type::Pointer(false, Box::new(t));
+            let t = Type::Pointer(false, Box::new(value.meta().type_.clone()));
             substitute(&mut meta.type_, &t, substitutions, coercions)
         }
 
@@ -757,169 +859,48 @@ fn traverse_sexpr<'a>(
                 monomorphisms,
                 scopes,
                 break_type,
+                let_status,
+                exports,
             )?;
             let t = Type::Pointer(false, Box::new(meta.type_.clone()));
             substitute(&mut value.meta_mut().type_, &t, substitutions, coercions)
         }
-    }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn traverse_lvalue<'a>(
-    lvalue: &mut LValue<'a>,
-    type_var_counter: &mut u64,
-    substitutions: &mut HashMap<u64, Type<'a>>,
-    coercions: &mut HashMap<u64, FloatOrInt>,
-    func_map: &HashMap<&'a str, Signature<'a>>,
-    struct_map: &HashMap<&'a str, Struct<'a>>,
-    monomorphisms: &mut Vec<(Type<'a>, usize)>,
-    scopes: &mut Vec<HashMap<&'a str, Type<'a>>>,
-    break_type: &mut Option<Type<'a>>,
-) -> Result<Type<'a>, CorrectnessError> {
-    match lvalue {
-        LValue::Symbol(sym) => {
-            for scope in scopes.iter().rev() {
-                if let Some(typ) = scope.get(sym) {
-                    return Ok(typ.clone());
-                }
-            }
+        SExpr::Import { imports, .. } => {
+            for (named_as, module_path) in imports {
+                match named_as {
+                    Some(_) => todo!(),
 
-            todo!("error handling");
-        }
-
-        LValue::Attribute(v, attr) => {
-            let mut t = traverse_lvalue(
-                &mut **v,
-                type_var_counter,
-                substitutions,
-                coercions,
-                func_map,
-                struct_map,
-                monomorphisms,
-                scopes,
-                break_type,
-            )?;
-            while let Type::TypeVariable(i) = t {
-                if let Some(u) = substitutions.get(&i) {
-                    t = u.clone();
-                } else {
-                    todo!("error handling");
-                }
-            }
-
-            if let Type::Struct(name, generics) = t {
-                if let Some(struct_) = struct_map.get(name) {
-                    let mut map = struct_
-                        .generics
-                        .iter()
-                        .zip(generics)
-                        .map(|(key, val)| {
-                            if let &Type::Generic(key) = key {
-                                (key, val)
-                            } else {
-                                unreachable!();
+                    None => {
+                        if let Some(exported) =
+                            exports.get(&Path::new(module_path).canonicalize().unwrap())
+                        {
+                            for func in exported.function_exports.iter() {
+                                func_map.last_mut().unwrap().insert(
+                                    func.clone(),
+                                    exported.func_map.get(func).unwrap().clone(),
+                                );
                             }
-                        })
-                        .collect();
 
-                    if let Some((_, typ)) = struct_.fields.iter().find(|(v, _)| v == attr) {
-                        t = typ.clone();
-                        t.replace_generics(type_var_counter, &mut map);
-                    } else {
-                        todo!("error handling for {}", attr);
+                            for struct_ in exported.struct_exports.iter() {
+                                struct_map.last_mut().unwrap().insert(
+                                    struct_.clone(),
+                                    exported.struct_map.get(struct_).unwrap().clone(),
+                                );
+                            }
+                        } else {
+                            todo!("error handling: unknown module \"{}\"", module_path);
+                        }
                     }
-                } else {
-                    todo!("error handling");
                 }
-            } else {
-                todo!("error handling");
             }
 
-            Ok(t)
-        }
-
-        LValue::Deref(v) => {
-            let mut type_ = traverse_lvalue(
-                &mut **v,
-                type_var_counter,
-                substitutions,
-                coercions,
-                func_map,
-                struct_map,
-                monomorphisms,
-                scopes,
-                break_type,
-            )?;
-            match type_ {
-                Type::Pointer(_, t) => Ok(*t),
-
-                Type::TypeVariable(_) => {
-                    let t = Type::TypeVariable(*type_var_counter);
-                    *type_var_counter += 1;
-                    substitute(
-                        &mut type_,
-                        &Type::Pointer(true, Box::new(t.clone())),
-                        substitutions,
-                        coercions,
-                    )?;
-                    Ok(t)
-                }
-
-                _ => todo!("error handling"),
-            }
-        }
-
-        LValue::Get(v, i) => {
-            traverse_sexpr(
-                &mut **i,
-                type_var_counter,
-                substitutions,
-                coercions,
-                func_map,
-                struct_map,
-                monomorphisms,
-                scopes,
-                break_type,
-            )?;
-            substitute(
-                &mut i.meta_mut().type_,
-                &Type::Int(false, 64),
-                substitutions,
-                coercions,
-            )?;
-            let mut type_ = traverse_lvalue(
-                &mut **v,
-                type_var_counter,
-                substitutions,
-                coercions,
-                func_map,
-                struct_map,
-                monomorphisms,
-                scopes,
-                break_type,
-            )?;
-            match type_ {
-                Type::Slice(_, t) => Ok(*t),
-
-                Type::TypeVariable(_) => {
-                    let t = Type::TypeVariable(*type_var_counter);
-                    *type_var_counter += 1;
-                    substitute(
-                        &mut type_,
-                        &Type::Slice(true, Box::new(t.clone())),
-                        substitutions,
-                        coercions,
-                    )?;
-                    Ok(t)
-                }
-
-                _ => todo!("error handling"),
-            }
+            Ok(())
         }
     }
 }
 
-fn flatten_substitution<'a>(t1: &mut Type<'a>, substitutions: &HashMap<u64, Type<'a>>) {
+fn flatten_substitution(t1: &mut Type, substitutions: &HashMap<u64, Type>) {
     match t1 {
         Type::Tuple(v) => {
             for v in v {
@@ -953,19 +934,7 @@ fn flatten_substitution<'a>(t1: &mut Type<'a>, substitutions: &HashMap<u64, Type
     }
 }
 
-fn apply_lvalue_substitutions<'a>(lvalue: &mut LValue<'a>, substitutions: &HashMap<u64, Type<'a>>) {
-    match lvalue {
-        LValue::Symbol(_) => (),
-        LValue::Attribute(v, _) => apply_lvalue_substitutions(&mut **v, substitutions),
-        LValue::Deref(v) => apply_lvalue_substitutions(&mut **v, substitutions),
-        LValue::Get(v, i) => {
-            apply_lvalue_substitutions(&mut **v, substitutions);
-            apply_substitutions(&mut **i, substitutions);
-        }
-    }
-}
-
-fn apply_substitutions<'a>(sexpr: &mut SExpr<'a>, substitutions: &HashMap<u64, Type<'a>>) {
+fn apply_substitutions(sexpr: &mut SExpr, substitutions: &HashMap<u64, Type>) {
     flatten_substitution(&mut sexpr.meta_mut().type_, substitutions);
 
     match sexpr {
@@ -1012,11 +981,14 @@ fn apply_substitutions<'a>(sexpr: &mut SExpr<'a>, substitutions: &HashMap<u64, T
             }
         }
 
-        SExpr::Declare { value, .. } => apply_substitutions(&mut **value, substitutions),
+        SExpr::Declare { settings, .. } => {
+            for setting in settings {
+                apply_substitutions(setting, substitutions);
+            }
+        }
 
-        SExpr::Assign { lvalue, value, .. } => {
+        SExpr::Assign { value, .. } => {
             apply_substitutions(&mut **value, substitutions);
-            apply_lvalue_substitutions(lvalue, substitutions);
         }
 
         SExpr::Attribute { top, .. } => apply_substitutions(&mut **top, substitutions),
@@ -1027,20 +999,24 @@ fn apply_substitutions<'a>(sexpr: &mut SExpr<'a>, substitutions: &HashMap<u64, T
 
         SExpr::SizeOf { type_, .. } => flatten_substitution(type_, substitutions),
 
-        SExpr::Ref { value, .. } => apply_lvalue_substitutions(&mut **value, substitutions),
+        SExpr::Ref { value, .. } => apply_substitutions(&mut **value, substitutions),
         SExpr::Deref { value, .. } => apply_substitutions(&mut **value, substitutions),
 
         _ => (),
     }
 }
 
-pub fn check<'a>(
-    sexprs: &mut Vec<SExpr<'a>>,
-    func_map: &HashMap<&'a str, Signature<'a>>,
-    struct_map: &HashMap<&'a str, Struct<'a>>,
+pub fn check(
+    name: &PathBuf,
+    module: &mut Module,
+    exports: &HashMap<PathBuf, ModuleExports>,
 ) -> Result<(), CorrectnessError> {
     let mut skip = 0;
     let mut done = HashSet::new();
+
+    let this_module = exports.get(name).unwrap();
+    let mut func_map = vec![this_module.func_map.clone()];
+    let mut struct_map = vec![this_module.struct_map.clone()];
 
     while {
         let mut monomorphisms = vec![];
@@ -1048,74 +1024,98 @@ pub fn check<'a>(
         let mut type_var_counter = 0;
         let mut substitutions = HashMap::new();
         let mut coercions = HashMap::new();
-        for sexpr in sexprs.iter_mut().skip(skip) {
-            if let SExpr::FuncDef {
-                ret_type,
-                args,
-                expr,
-                ..
-            } = sexpr
-            {
-                if args.iter().any(|(_, v)| v.has_generic()) || ret_type.has_generic() {
-                    continue;
-                }
-
-                let mut scopes = vec![HashMap::new()];
-                for (arg, type_) in args {
-                    scopes.last_mut().unwrap().insert(*arg, type_.clone());
-                }
-
-                traverse_sexpr(
-                    expr,
-                    &mut type_var_counter,
-                    &mut substitutions,
-                    &mut coercions,
-                    func_map,
-                    struct_map,
-                    &mut monomorphisms,
-                    &mut scopes,
-                    &mut None,
-                )?;
-
-                substitute(
-                    &mut expr.meta_mut().type_,
+        for sexpr in module.sexprs.iter_mut().skip(skip) {
+            match sexpr {
+                SExpr::FuncDef {
                     ret_type,
-                    &mut substitutions,
-                    &mut coercions,
-                )?;
+                    args,
+                    expr,
+                    ..
+                } => {
+                    if args.iter().any(|(_, v)| v.has_generic()) || ret_type.has_generic() {
+                        continue;
+                    }
 
-                for (&i, &coercion) in coercions.iter() {
-                    match substitutions.entry(i) {
-                        Entry::Occupied(v) => {
-                            let mut t = v.get().clone();
-                            while let Type::TypeVariable(j) = t {
-                                if let Some(v) = substitutions.get(&j) {
-                                    t = v.clone();
-                                } else {
-                                    match coercion {
-                                        FloatOrInt::Float => t = Type::F64,
-                                        FloatOrInt::Int => t = Type::Int(true, 32),
-                                    };
-                                    substitutions.insert(j, t);
-                                    break;
+                    let mut scopes = vec![HashMap::new()];
+                    for (arg, type_) in args {
+                        scopes
+                            .last_mut()
+                            .unwrap()
+                            .insert(arg.to_string(), (type_.clone(), LetStatus::Direct));
+                    }
+
+                    traverse_sexpr(
+                        expr,
+                        &mut type_var_counter,
+                        &mut substitutions,
+                        &mut coercions,
+                        &mut func_map,
+                        &mut struct_map,
+                        &mut monomorphisms,
+                        &mut scopes,
+                        &mut None,
+                        LetStatus::NoLet,
+                        exports,
+                    )?;
+
+                    substitute(
+                        &mut expr.meta_mut().type_,
+                        ret_type,
+                        &mut substitutions,
+                        &mut coercions,
+                    )?;
+
+                    for (&i, &coercion) in coercions.iter() {
+                        match substitutions.entry(i) {
+                            Entry::Occupied(v) => {
+                                let mut t = v.get().clone();
+                                while let Type::TypeVariable(j) = t {
+                                    if let Some(v) = substitutions.get(&j) {
+                                        t = v.clone();
+                                    } else {
+                                        match coercion {
+                                            FloatOrInt::Float => t = Type::F64,
+                                            FloatOrInt::Int => t = Type::Int(true, 32),
+                                        };
+                                        substitutions.insert(j, t);
+                                        break;
+                                    }
                                 }
                             }
-                        }
 
-                        Entry::Vacant(v) => {
-                            match coercion {
-                                FloatOrInt::Float => v.insert(Type::F64),
-                                FloatOrInt::Int => v.insert(Type::Int(true, 32)),
-                            };
+                            Entry::Vacant(v) => {
+                                match coercion {
+                                    FloatOrInt::Float => v.insert(Type::F64),
+                                    FloatOrInt::Int => v.insert(Type::Int(true, 32)),
+                                };
+                            }
                         }
                     }
+
+                    apply_substitutions(expr, &substitutions);
                 }
 
-                apply_substitutions(expr, &substitutions);
+                SExpr::Import { .. } => {
+                    traverse_sexpr(
+                        sexpr,
+                        &mut type_var_counter,
+                        &mut substitutions,
+                        &mut coercions,
+                        &mut func_map,
+                        &mut struct_map,
+                        &mut monomorphisms,
+                        &mut Vec::new(),
+                        &mut None,
+                        LetStatus::NoLet,
+                        exports,
+                    )?;
+                }
+
+                _ => (),
             }
         }
 
-        skip = sexprs.len();
+        skip = module.sexprs.len();
 
         if !monomorphisms.is_empty() {
             for (mut t, index) in monomorphisms {
@@ -1126,7 +1126,7 @@ pub fn check<'a>(
                 }
                 done.insert((t.clone(), index));
 
-                let mut monomorphised = sexprs[index].clone();
+                let mut monomorphised = module.sexprs[index].clone();
 
                 if let SExpr::FuncDef {
                     meta,
@@ -1147,12 +1147,12 @@ pub fn check<'a>(
 
                         *ret_type = *r;
 
-                        sexprs.push(monomorphised);
+                        module.sexprs.push(monomorphised);
                     }
                 }
             }
 
-            skip != sexprs.len()
+            skip != module.sexprs.len()
         } else {
             false
         }
@@ -1161,19 +1161,7 @@ pub fn check<'a>(
     Ok(())
 }
 
-fn update_generic_refs_lvalue<'a>(lvalue: &mut LValue<'a>, map: &mut HashMap<&'a str, Type<'a>>) {
-    match lvalue {
-        LValue::Symbol(_) => (),
-        LValue::Attribute(v, _) => update_generic_refs_lvalue(&mut **v, map),
-        LValue::Deref(v) => update_generic_refs_lvalue(&mut **v, map),
-        LValue::Get(v, i) => {
-            update_generic_refs_lvalue(&mut **v, map);
-            update_generic_refs(&mut **i, map);
-        }
-    }
-}
-
-fn update_generic_refs<'a>(expr: &mut SExpr<'a>, map: &mut HashMap<&'a str, Type<'a>>) {
+fn update_generic_refs(expr: &mut SExpr, map: &mut HashMap<String, Type>) {
     match expr {
         SExpr::Tuple { tuple, .. } => {
             for value in tuple {
@@ -1215,9 +1203,12 @@ fn update_generic_refs<'a>(expr: &mut SExpr<'a>, map: &mut HashMap<&'a str, Type
                 update_generic_refs(value, map);
             }
         }
-        SExpr::Declare { value, .. } => update_generic_refs(&mut **value, map),
-        SExpr::Assign { lvalue, value, .. } => {
-            update_generic_refs_lvalue(lvalue, map);
+        SExpr::Declare { settings, .. } => {
+            for setting in settings {
+                update_generic_refs(setting, map);
+            }
+        }
+        SExpr::Assign { value, .. } => {
             update_generic_refs(&mut **value, map);
         }
         SExpr::Attribute { top, .. } => update_generic_refs(&mut **top, map),
@@ -1230,18 +1221,14 @@ fn update_generic_refs<'a>(expr: &mut SExpr<'a>, map: &mut HashMap<&'a str, Type
             type_.replace_generics(&mut tvc, map);
         }
 
-        SExpr::Ref { value, .. } => update_generic_refs_lvalue(&mut **value, map),
+        SExpr::Ref { value, .. } => update_generic_refs(&mut **value, map),
         SExpr::Deref { value, .. } => update_generic_refs(&mut **value, map),
 
         _ => (),
     }
 }
 
-fn extract_generics<'a>(
-    original: &Type<'a>,
-    monomorphised: &Type<'a>,
-    map: &mut HashMap<&'a str, Type<'a>>,
-) {
+fn extract_generics(original: &Type, monomorphised: &Type, map: &mut HashMap<String, Type>) {
     match (original, monomorphised) {
         (Type::Tuple(v1), Type::Tuple(v2)) => {
             for (v1, v2) in v1.iter().zip(v2) {
@@ -1258,7 +1245,7 @@ fn extract_generics<'a>(
         }
 
         (Type::Generic(g), v) => {
-            map.insert(*g, v.clone());
+            map.insert(g.clone(), v.clone());
         }
 
         (Type::Function(a1, r1), Type::Function(a2, r2)) => {
@@ -1281,209 +1268,258 @@ pub enum SignatureLinkage {
 }
 
 #[derive(Debug, Clone)]
-pub struct Signature<'a> {
-    pub arg_types: Vec<Type<'a>>,
-    pub ret_type: Type<'a>,
+pub struct Signature {
+    pub arg_types: Vec<Type>,
+    pub ret_type: Type,
     pub index: Option<usize>,
     pub linkage: SignatureLinkage,
 }
 
-pub fn create_default_signatures<'a>() -> HashMap<&'a str, Signature<'a>> {
+// TODO: replace with real stuff
+fn create_default_signatures() -> HashMap<String, Signature> {
     let mut map = HashMap::new();
     map.insert(
-        "+",
+        "+".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
-            ret_type: Type::Generic("a"),
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
+            ret_type: Type::Generic("a".to_string()),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "-",
+        "-".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
-            ret_type: Type::Generic("a"),
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
+            ret_type: Type::Generic("a".to_string()),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "*",
+        "*".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
-            ret_type: Type::Generic("a"),
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
+            ret_type: Type::Generic("a".to_string()),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "/",
+        "/".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
-            ret_type: Type::Generic("a"),
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
+            ret_type: Type::Generic("a".to_string()),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "%",
+        "%".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
-            ret_type: Type::Generic("a"),
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
+            ret_type: Type::Generic("a".to_string()),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "<",
+        "<".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
             ret_type: Type::Int(false, 1),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        ">",
+        ">".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
             ret_type: Type::Int(false, 1),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "<=",
+        "<=".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
             ret_type: Type::Int(false, 1),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        ">=",
+        ">=".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
             ret_type: Type::Int(false, 1),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "<<",
+        "<<".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
-            ret_type: Type::Generic("a"),
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
+            ret_type: Type::Generic("a".to_string()),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        ">>",
+        ">>".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
-            ret_type: Type::Generic("a"),
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
+            ret_type: Type::Generic("a".to_string()),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "&",
+        "&".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
-            ret_type: Type::Generic("a"),
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
+            ret_type: Type::Generic("a".to_string()),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "|",
+        "|".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
-            ret_type: Type::Generic("a"),
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
+            ret_type: Type::Generic("a".to_string()),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "^",
+        "^".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
-            ret_type: Type::Generic("a"),
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
+            ret_type: Type::Generic("a".to_string()),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "==",
+        "==".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
             ret_type: Type::Int(false, 1),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "!=",
+        "!=".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a"), Type::Generic("a")],
+            arg_types: vec![
+                Type::Generic("a".to_string()),
+                Type::Generic("a".to_string()),
+            ],
             ret_type: Type::Int(false, 1),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "cast",
+        "cast".to_string(),
         Signature {
-            arg_types: vec![Type::Generic("a")],
-            ret_type: Type::Generic("b"),
+            arg_types: vec![Type::Generic("a".to_string())],
+            ret_type: Type::Generic("b".to_string()),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "alloca",
+        "alloca".to_string(),
         Signature {
             arg_types: vec![Type::Int(false, 64)],
-            ret_type: Type::Slice(true, Box::new(Type::Generic("a"))),
+            ret_type: Type::Slice(true, Box::new(Type::Generic("a".to_string()))),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "ptr-add",
+        "ptr-add".to_string(),
         Signature {
             arg_types: vec![
-                Type::Pointer(true, Box::new(Type::Generic("a"))),
+                Type::Pointer(true, Box::new(Type::Generic("a".to_string()))),
                 Type::Int(false, 64),
             ],
-            ret_type: Type::Pointer(true, Box::new(Type::Generic("a"))),
+            ret_type: Type::Pointer(true, Box::new(Type::Generic("a".to_string()))),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "ptr-sub",
+        "ptr-sub".to_string(),
         Signature {
             arg_types: vec![
-                Type::Pointer(true, Box::new(Type::Generic("a"))),
+                Type::Pointer(true, Box::new(Type::Generic("a".to_string()))),
                 Type::Int(false, 64),
             ],
-            ret_type: Type::Pointer(true, Box::new(Type::Generic("a"))),
+            ret_type: Type::Pointer(true, Box::new(Type::Generic("a".to_string()))),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
     );
     map.insert(
-        "slice",
+        "slice".to_string(),
         Signature {
             arg_types: vec![
                 Type::Int(false, 64),
-                Type::Pointer(true, Box::new(Type::Generic("a"))),
+                Type::Pointer(true, Box::new(Type::Generic("a".to_string()))),
             ],
-            ret_type: Type::Slice(true, Box::new(Type::Generic("a"))),
+            ret_type: Type::Slice(true, Box::new(Type::Generic("a".to_string()))),
             index: None,
             linkage: SignatureLinkage::Builtin,
         },
@@ -1491,7 +1527,7 @@ pub fn create_default_signatures<'a>() -> HashMap<&'a str, Signature<'a>> {
     map
 }
 
-pub fn extract_signatures<'a>(sexprs: &[SExpr<'a>], map: &mut HashMap<&'a str, Signature<'a>>) {
+fn extract_signatures(sexprs: &[SExpr], map: &mut HashMap<String, Signature>) {
     for (i, sexpr) in sexprs.iter().enumerate() {
         if let SExpr::FuncDef { meta, name, .. } | SExpr::FuncExtern { meta, name, .. } = sexpr {
             let (arg_types, ret_type) = match &meta.type_ {
@@ -1500,7 +1536,7 @@ pub fn extract_signatures<'a>(sexprs: &[SExpr<'a>], map: &mut HashMap<&'a str, S
             };
             let index = Some(i);
 
-            match map.entry(*name) {
+            match map.entry(name.to_string()) {
                 Entry::Occupied(_) => {
                     todo!("error handling");
                 }
@@ -1523,13 +1559,13 @@ pub fn extract_signatures<'a>(sexprs: &[SExpr<'a>], map: &mut HashMap<&'a str, S
 }
 
 #[derive(Debug, Clone)]
-pub struct Struct<'a> {
-    pub name: &'a str,
-    pub generics: Vec<Type<'a>>,
-    pub fields: Vec<(&'a str, Type<'a>)>,
+pub struct Struct {
+    pub name: String,
+    pub generics: Vec<Type>,
+    pub fields: Vec<(String, Type)>,
 }
 
-pub fn extract_structs<'a>(sexprs: &[SExpr<'a>], map: &mut HashMap<&'a str, Struct<'a>>) {
+fn extract_structs(sexprs: &[SExpr], map: &mut HashMap<String, Struct>) {
     for sexpr in sexprs.iter() {
         if let SExpr::StructDef { name, fields, .. } = sexpr {
             let mut generics = vec![];
@@ -1539,14 +1575,68 @@ pub fn extract_structs<'a>(sexprs: &[SExpr<'a>], map: &mut HashMap<&'a str, Stru
             }
 
             let struct_ = Struct {
-                name: *name,
+                name: name.clone(),
                 generics,
                 fields: fields.clone(),
             };
 
-            if map.insert(*name, struct_).is_some() {
+            if map.insert(name.clone(), struct_).is_some() {
                 todo!("error handling");
             }
         }
     }
+}
+
+pub fn create_module(sexprs: Vec<SExpr>) -> (Module, ModuleExports) {
+    let mut func_map = create_default_signatures();
+    extract_signatures(&sexprs, &mut func_map);
+    let mut struct_map = HashMap::new();
+    extract_structs(&sexprs, &mut struct_map);
+
+    let mut function_exports = Vec::new();
+    let mut struct_exports = Vec::new();
+
+    for sexpr in sexprs.iter() {
+        match sexpr {
+            SExpr::FuncDef {
+                ann: Annotations { public: true, .. },
+                name,
+                ..
+            } => {
+                function_exports.push(name.clone());
+            }
+
+            SExpr::StructDef {
+                ann: Annotations { public: true, .. },
+                name,
+                ..
+            } => {
+                struct_exports.push(name.clone());
+            }
+
+            _ => (),
+        }
+    }
+
+    (
+        Module { sexprs },
+        ModuleExports {
+            func_map,
+            function_exports,
+            struct_map,
+            struct_exports,
+        },
+    )
+}
+
+pub struct Module {
+    pub sexprs: Vec<SExpr>,
+}
+
+#[derive(Debug)]
+pub struct ModuleExports {
+    func_map: HashMap<String, Signature>,
+    function_exports: Vec<String>,
+    struct_map: HashMap<String, Struct>,
+    struct_exports: Vec<String>,
 }
