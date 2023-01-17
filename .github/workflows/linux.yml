@@ -26,6 +26,7 @@ jobs:
       - name: Test
         run: |
           ./target/release/amethyst script/fib.amy
+          ls
           gcc a.s -o fib
           ./fib
           [ $? -ne 55 ] exit 1
