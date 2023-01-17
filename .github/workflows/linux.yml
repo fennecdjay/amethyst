@@ -18,10 +18,17 @@ jobs:
           override: true
 
       - name: Edit Cargo.toml
-        run: sed -i 's#codegem = { path = "../codegem" }#codegem = { git = "https://github.com/code-gem/codegem" }#' Cargo.toml
+        run: cp scripts/Cargo.toml .
 
       - name: Release Build
         run: cargo build --release
+
+      - name: Test
+        run: |
+          ./target/release/amethyst script/fib.amy
+          gcc a.s -o fib
+          ./fib
+          [ $? -ne 55 ] exit 1
 
 # todo: some testing
 # releases?
