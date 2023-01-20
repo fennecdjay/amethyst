@@ -27,7 +27,8 @@ jobs:
         run: |
           ./target/release/amethyst scripts/fib.amy
           sed 's/%//g' a.s > b.s
-          gcc b.s -o fib
+          sed 's/main/_main/g' b.s > c.s
+          gcc c.s -o fib
           ./fib || [ $? -ne 55 ] && exit 1 || true
 
 # todo: some testing
