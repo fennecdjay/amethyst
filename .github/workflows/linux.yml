@@ -27,7 +27,7 @@ jobs:
         run: |
           ./target/release/amethyst scripts/fib.amy
           gcc a.s -o fib
-          ./fib || [ $? -ne 55 ] && exit 1 || true
+          ./fib; test $? -eq 55
 
 # todo: some testing
 # releases?
