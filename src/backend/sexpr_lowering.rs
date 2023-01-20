@@ -23,7 +23,7 @@ fn lower_helper(
 ) -> Option<Value> {
     let type_ = convert_type(&sexpr.meta().type_);
     match sexpr {
-        SExpr::Int { meta, value } => builder.push_instruction(value.to_integer_operation()).unwrap(),
+        SExpr::Int { meta, value } => builder.push_instruction(value.to_integer_operation_as(type_)).unwrap(),
 
         SExpr::Float { meta, value } => todo!(),
         SExpr::Str { meta, value } => todo!(),
@@ -65,7 +65,7 @@ fn lower_helper(
                 mapping.push((last_block, then));
                 let cont_block = builder.push_block().unwrap();
                 builder.switch_to_block(current_block);
-                builder.set_terminator(Terminator::Branch(cond, then_block, cont_block));
+                builder.set_terminator(Terminator::Branch(cond, then_block, cont_block)).unwrap();
                 builder.switch_to_block(cont_block);
                 args.var_map.pop();
             }
@@ -82,7 +82,7 @@ fn lower_helper(
                 .into_iter()
                 .filter_map(|(block, value)| {
                     builder.switch_to_block(block);
-                    builder.set_terminator(Terminator::Jump(post_block));
+                    builder.set_terminator(Terminator::Jump(post_block)).unwrap();
                     value.map(|v| (block, v))
                 })
                 .collect();
@@ -99,10 +99,10 @@ fn lower_helper(
             args.breaks.push(Vec::new());
             args.var_map.push(HashMap::new());
             let block = builder.push_block().unwrap();
-            builder.set_terminator(Terminator::Jump(block));
+            builder.set_terminator(Terminator::Jump(block)).unwrap();
             builder.switch_to_block(block);
             lower_helper(builder, *value, args);
-            builder.set_terminator(Terminator::Jump(block));
+            builder.set_terminator(Terminator::Jump(block)).unwrap();
 
             args.var_map.pop();
             if let Some(mappings) = args.breaks.pop() {
@@ -111,7 +111,7 @@ fn lower_helper(
                     .into_iter()
                     .filter_map(|(block, value)| {
                         builder.switch_to_block(block);
-                        builder.set_terminator(Terminator::Jump(final_block));
+                        builder.set_terminator(Terminator::Jump(final_block)).unwrap();
                         value.map(|v| (block, v))
                     })
                     .collect();
@@ -276,6 +276,15 @@ fn lower_helper(
                 builder.push_instruction(Operation::BitXor(values[0], values[1])).unwrap()
             }
 
+            SExpr::Symbol { value, .. } if value == "ptr-set" => {
+                let values: Vec<_> = values
+                    .into_iter()
+                    .flat_map(|v| lower_helper(builder, v, args))
+                    .collect();
+                builder.push_instruction(Operation::Store(values[0], values[1]));
+                builder.push_instruction(true.to_integer_operation()).unwrap()
+            }
+
             SExpr::Symbol { meta, value } => {
                 for scope in args.var_map.iter().rev() {
                     if let Some(var) = scope.get(&value) {
@@ -339,6 +348,7 @@ fn lower_helper(
         }
 
         SExpr::Assign { meta, var, value } => {
+            let type_ = value.meta().type_.clone();
             if let Some(v) = lower_helper(builder, *value, args) {
                 for scope in args.var_map.iter().rev() {
                     if let Some(var) = scope.get(&var) {
@@ -349,7 +359,7 @@ fn lower_helper(
 
                 if args.in_let {
                     let variable = builder
-                        .push_variable(&var, &convert_type(&meta.type_))
+                        .push_variable(&var, &convert_type(&type_))
                         .unwrap();
                     args.var_map.last_mut().unwrap().insert(var, variable);
                     builder.push_instruction(Operation::SetVar(variable, v));
@@ -364,7 +374,11 @@ fn lower_helper(
         SExpr::SliceGet { meta, top, index } => todo!(),
         SExpr::SizeOf { meta, type_ } => todo!(),
         SExpr::Ref { meta, value } => todo!(),
-        SExpr::Deref { meta, value } => todo!(),
+
+        SExpr::Deref { meta, value } => {
+            let value = lower_helper(builder, *value, args).unwrap();
+            builder.push_instruction(Operation::Load(value)).unwrap()
+        }
 
         SExpr::Import { .. } => None,
     }
@@ -377,7 +391,7 @@ fn convert_type(type_: &SExprType) -> IrType {
         SExprType::F64 => todo!(),
         SExprType::Tuple(v) if v.is_empty() => IrType::Void,
         SExprType::Tuple(_) => todo!(),
-        SExprType::Pointer(_, _) => todo!(),
+        SExprType::Pointer(_, v) => IrType::Pointer(Box::new(convert_type(&**v))),
         SExprType::Slice(_, _) => todo!(),
         SExprType::Struct(_, _) => todo!(),
         SExprType::Function(_, _) => todo!(),
@@ -467,9 +481,9 @@ pub fn lower(sexprs: Vec<SExpr>) -> Module {
                 let expr = lower_helper(&mut builder, *expr, &mut helper_args);
                 helper_args.var_map.pop();
                 if let Some(ret) = expr {
-                    builder.set_terminator(Terminator::Return(ret));
+                    builder.set_terminator(Terminator::Return(ret)).unwrap();
                 } else {
-                    builder.set_terminator(Terminator::ReturnVoid);
+                    builder.set_terminator(Terminator::ReturnVoid).unwrap();
                 }
             }
 
@@ -485,5 +499,5 @@ pub fn lower(sexprs: Vec<SExpr>) -> Module {
         }
     }
 
-    builder.build()
+    builder.build().unwrap()
 }
