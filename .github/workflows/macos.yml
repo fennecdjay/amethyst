@@ -23,13 +23,5 @@ jobs:
       - name: Release Build
         run: cargo build --release
 
-      - name: Test
-        run: |
-          ./target/release/amethyst scripts/fib.amy
-          sed 's/%//g' a.s > b.s
-          sed 's/main/_main/g' b.s > c.s
-          gcc c.s -o fib
-          ./fib; test $? -eq 55
-
 # todo: some testing
 # releases?

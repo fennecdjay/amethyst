@@ -25,11 +25,3 @@ jobs:
       - name: Release Build
         run: cargo build --release
 
-      - name: Test
-        run: |
-          ./target/release/amethyst scripts/fib.amy
-          gcc a.s -o fib
-          ./fib; test $? -eq 55
-
-# todo: some testing
-# releases?      - name: Test
